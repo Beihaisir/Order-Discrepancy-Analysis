@@ -1,118 +1,43 @@
-#!/usr/bin/env python3
+# app.py
 # -*- coding: utf-8 -*-
 
-"""
-最终完整版：POS 订单支付 vs 订单菜品 对账（自动兼容 xls/xlsx/“内容是xls但后缀是xlsx”）
-
-功能：
-1) 弹出文件选择框：选择【订单支付报告】、【订单菜品报告】两个文件
-2) 自动识别真实格式（看文件头，不看后缀）
-   - OLE2/CFB(BIFF) => xls => xlrd 读取
-   - ZIP => xlsx => openpyxl(read_only=True) 流式读取
-3) 对账逻辑：
-   - 正常订单：按 POS销售单号 对账（支付表“总金额” vs 菜品表“优惠后小计价格”汇总）
-   - 退款订单：按 POS退款单号 对账（只要“POS退款单号”非空，则按退款单号聚合对账）
-4) 容差：默认 1 角（0.10 元 = 10 分）
-5) 输出：
-   - 差异明细 CSV（中文表头）
-   - 差异原因统计 CSV（中文表头）
-   保存位置由你在“另存为”对话框自主选择
-
-依赖：
-pip install xlrd openpyxl pandas
-"""
-
-import os
 import re
+from io import BytesIO
 from collections import defaultdict, Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import streamlit as st
 
 
-# -----------------------------
-# 文件选择/保存对话框
-# -----------------------------
-def pick_two_files() -> Tuple[str, str]:
-    import tkinter as tk
-    from tkinter import filedialog
-
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-
-    pay_path = filedialog.askopenfilename(
-        title="请选择【订单支付报告】文件（xls/xlsx均可）",
-        filetypes=[("Excel 文件", "*.xls *.xlsx"), ("所有文件", "*.*")]
-    )
-    if not pay_path:
-        raise RuntimeError("未选择订单支付报告文件。")
-
-    item_path = filedialog.askopenfilename(
-        title="请选择【订单菜品报告】文件（xls/xlsx均可）",
-        filetypes=[("Excel 文件", "*.xls *.xlsx"), ("所有文件", "*.*")]
-    )
-    if not item_path:
-        raise RuntimeError("未选择订单菜品报告文件。")
-
-    return pay_path, item_path
-
-
-def pick_save_path(default_name: str, title: str) -> str:
-    import tkinter as tk
-    from tkinter import filedialog
-
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-
-    path = filedialog.asksaveasfilename(
-        title=title,
-        defaultextension=".csv",
-        initialfile=default_name,
-        filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")]
-    )
-    if not path:
-        raise RuntimeError("未选择保存位置，已取消输出。")
-    return path
-
-
-# -----------------------------
-# 格式识别（不看后缀，看文件头）
-# -----------------------------
-def detect_excel_format(path: str) -> str:
-    """
-    返回 'xls' 或 'xlsx'
-    - xls (OLE2/CFB): D0 CF 11 E0 A1 B1 1A E1
-    - xlsx (ZIP): PK 03 04 / PK 05 06 / PK 07 08
-    """
-    with open(path, "rb") as f:
-        head = f.read(8)
-
+# =============================
+# 格式识别（看文件头，不看后缀）
+# =============================
+def detect_excel_format_from_bytes(data: bytes) -> str:
+    head = data[:8]
+    # xls (OLE2/CFB)
     if head.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
         return "xls"
+    # xlsx (ZIP)
     if head.startswith(b"PK\x03\x04") or head.startswith(b"PK\x05\x06") or head.startswith(b"PK\x07\x08"):
         return "xlsx"
+    raise RuntimeError("无法识别文件格式：既不是 OLE2 xls，也不是 ZIP xlsx")
 
-    raise RuntimeError(f"无法识别文件格式：{path}（既不是 OLE2 xls，也不是 ZIP xlsx）")
 
-
-# -----------------------------
+# =============================
 # 工具函数
-# -----------------------------
+# =============================
 def norm_str(x: Any) -> str:
     if x is None:
         return ""
     s = str(x).strip()
-    # 单号常被读成浮点：去掉末尾 .0
     if re.fullmatch(r"\d+\.0", s):
         s = s[:-2]
     return s
 
 
 def money_to_cents(x: Any) -> int:
-    """金额转“分”(int)，避免浮点误差。"""
     if x is None:
         return 0
     if isinstance(x, int):
@@ -145,16 +70,15 @@ def find_header_row_in_rows(rows: List[List[Any]], required_cols: List[str]) -> 
     return None
 
 
-def open_excel_iter(path: str, required_cols: List[str], scan_rows: int = 60):
-    """
-    统一打开并返回数据行迭代器（从表头下一行开始）：
-    返回：header_row_index(0-based), col_map, rows_iterator
-    """
-    fmt = detect_excel_format(path)
+# =============================
+# 统一读取：从 bytes 得到“数据行迭代器”
+# =============================
+def open_excel_iter_from_bytes(data: bytes, required_cols: List[str], scan_rows: int = 80):
+    fmt = detect_excel_format_from_bytes(data)
 
     if fmt == "xls":
         import xlrd
-        book = xlrd.open_workbook(path, formatting_info=False)
+        book = xlrd.open_workbook(file_contents=data, formatting_info=False)
         sh = book.sheet_by_index(0)
 
         max_r = min(scan_rows, sh.nrows)
@@ -168,11 +92,11 @@ def open_excel_iter(path: str, required_cols: List[str], scan_rows: int = 60):
             for r in range(header_r + 1, sh.nrows):
                 yield [sh.cell_value(r, c) for c in range(sh.ncols)]
 
-        return header_r, cmap, row_iter()
+        return cmap, row_iter(), fmt
 
-    # fmt == "xlsx"
+    # xlsx
     import openpyxl
-    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    wb = openpyxl.load_workbook(BytesIO(data), read_only=True, data_only=True)
     ws = wb.worksheets[0]
 
     sample = []
@@ -185,17 +109,15 @@ def open_excel_iter(path: str, required_cols: List[str], scan_rows: int = 60):
     header_r, cmap = found  # 0-based
 
     def row_iter():
-        # openpyxl 行号 1-based，所以数据从 header_r(0-based)+2 开始
         for row in ws.iter_rows(min_row=header_r + 2, values_only=True):
             yield list(row)
 
-    # 不要提前 close，ws 还要迭代；脚本结束进程退出即可
-    return header_r, cmap, row_iter()
+    return cmap, row_iter(), fmt
 
 
-# -----------------------------
+# =============================
 # 聚合结构
-# -----------------------------
+# =============================
 @dataclass
 class Agg:
     cents_sum: int = 0
@@ -214,21 +136,16 @@ def agg_add(a: Agg, cents: int, meta: Optional[str] = None):
         a.meta_counter[meta] += 1
 
 
-# -----------------------------
-# 读取并聚合：支付表/菜品表
-# -----------------------------
-def read_payment_agg(path: str) -> Tuple[Dict[str, Agg], Dict[str, Agg]]:
-    """
-    支付表：
-    - POS退款单号为空：按 POS销售单号 聚合
-    - POS退款单号非空：按 POS退款单号 聚合
-    金额字段：总金额
-    """
+# =============================
+# 读取并聚合：支付表 / 菜品表（缓存）
+# =============================
+@st.cache_data(show_spinner=False)
+def read_payment_agg(file_bytes: bytes) -> Tuple[Dict[str, Agg], Dict[str, Agg], str]:
     required = ["POS销售单号", "POS退款单号", "总金额", "支付类型", "门店"]
-    _, cmap, rows = open_excel_iter(path, required_cols=required)
+    cmap, rows, fmt = open_excel_iter_from_bytes(file_bytes, required_cols=required)
 
-    sales_agg: Dict[str, Agg] = defaultdict(Agg)
-    refund_agg: Dict[str, Agg] = defaultdict(Agg)
+    sales: Dict[str, Agg] = defaultdict(Agg)
+    refund: Dict[str, Agg] = defaultdict(Agg)
 
     for row in rows:
         def v(col):
@@ -245,27 +162,21 @@ def read_payment_agg(path: str) -> Tuple[Dict[str, Agg], Dict[str, Agg]]:
             continue
 
         meta = f"{store}|{pay_type}" if (store or pay_type) else None
-
         if pos_refund:
-            agg_add(refund_agg[pos_refund], cents, meta)
+            agg_add(refund[pos_refund], cents, meta)
         else:
-            agg_add(sales_agg[pos_sale], cents, meta)
+            agg_add(sales[pos_sale], cents, meta)
 
-    return sales_agg, refund_agg
+    return sales, refund, fmt
 
 
-def read_items_agg(path: str) -> Tuple[Dict[str, Agg], Dict[str, Agg]]:
-    """
-    菜品表：
-    - POS退款单号为空：按 POS销售单号 聚合
-    - POS退款单号非空：按 POS退款单号 聚合
-    金额字段：优惠后小计价格（按单号求和）
-    """
+@st.cache_data(show_spinner=False)
+def read_items_agg(file_bytes: bytes) -> Tuple[Dict[str, Agg], Dict[str, Agg], str]:
     required = ["POS销售单号", "POS退款单号", "优惠后小计价格", "单据类型", "菜品状态", "门店", "菜品名称"]
-    _, cmap, rows = open_excel_iter(path, required_cols=required)
+    cmap, rows, fmt = open_excel_iter_from_bytes(file_bytes, required_cols=required)
 
-    sales_agg: Dict[str, Agg] = defaultdict(Agg)
-    refund_agg: Dict[str, Agg] = defaultdict(Agg)
+    sales: Dict[str, Agg] = defaultdict(Agg)
+    refund: Dict[str, Agg] = defaultdict(Agg)
 
     for row in rows:
         def v(col):
@@ -285,18 +196,17 @@ def read_items_agg(path: str) -> Tuple[Dict[str, Agg], Dict[str, Agg]]:
             continue
 
         meta = f"{store}|{doc_type}|{dish_status}|{dish_name}" if (store or doc_type or dish_status or dish_name) else None
-
         if pos_refund:
-            agg_add(refund_agg[pos_refund], cents, meta)
+            agg_add(refund[pos_refund], cents, meta)
         else:
-            agg_add(sales_agg[pos_sale], cents, meta)
+            agg_add(sales[pos_sale], cents, meta)
 
-    return sales_agg, refund_agg
+    return sales, refund, fmt
 
 
-# -----------------------------
-# 对账：差异输出 & 原因猜测
-# -----------------------------
+# =============================
+# 对账
+# =============================
 def compare_aggs(pay: Dict[str, Agg], item: Dict[str, Agg], kind: str, tolerance_cents: int) -> pd.DataFrame:
     keys = set(pay.keys()) | set(item.keys())
     out = []
@@ -334,93 +244,104 @@ def compare_aggs(pay: Dict[str, Agg], item: Dict[str, Agg], kind: str, tolerance
         item_meta = "; ".join([f"{m}*{c}" for m, c in (ia.meta_counter.most_common(3) if ia else [])])
 
         out.append({
-            "kind": kind,
-            "key": k,
-            "pay_sum": cents_to_money_str(ps),
-            "item_sum": cents_to_money_str(is_),
-            "diff(pay-item)": cents_to_money_str(diff),
-            "pay_rows": pa.row_count if pa else 0,
-            "item_rows": ia.row_count if ia else 0,
-            "reason_guess": reason,
-            "pay_meta_top3": pay_meta,
-            "item_meta_top3": item_meta,
+            "单据类型（销售/退款）": "销售" if kind == "SALE" else "退款",
+            "POS单号": k,
+            "支付表总金额": cents_to_money_str(ps),
+            "菜品表优惠后金额": cents_to_money_str(is_),
+            "金额差异（支付-菜品）": cents_to_money_str(diff),
+            "支付记录行数": pa.row_count if pa else 0,
+            "菜品记录行数": ia.row_count if ia else 0,
+            "差异原因判断": reason,
+            "支付侧关键信息（门店|支付类型 Top3）": pay_meta,
+            "菜品侧关键信息（门店|单据类型|状态|菜品 Top3）": item_meta,
         })
 
     df = pd.DataFrame(out)
     if not df.empty:
-        df["_abs"] = df["diff(pay-item)"].apply(money_to_cents).abs()
+        df["_abs"] = df["金额差异（支付-菜品）"].apply(money_to_cents).abs()
         df = df.sort_values("_abs", ascending=False).drop(columns=["_abs"])
     return df
 
 
-# -----------------------------
-# 中文表头映射
-# -----------------------------
-COLUMN_CN_MAP = {
-    "kind": "单据类型（销售/退款）",
-    "key": "POS单号",
-    "pay_sum": "支付表总金额",
-    "item_sum": "菜品表优惠后金额",
-    "diff(pay-item)": "金额差异（支付-菜品）",
-    "pay_rows": "支付记录行数",
-    "item_rows": "菜品记录行数",
-    "reason_guess": "差异原因判断",
-    "pay_meta_top3": "支付侧关键信息（门店|支付类型 Top3）",
-    "item_meta_top3": "菜品侧关键信息（门店|单据类型|状态|菜品 Top3）",
-}
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
-def main():
-    pay_path, item_path = pick_two_files()
+# =============================
+# Streamlit 页面
+# =============================
+st.set_page_config(page_title="POS 对账：支付 vs 菜品", layout="wide")
+st.title("POS 对账：订单支付报告 vs 订单菜品报告")
 
-    for p in (pay_path, item_path):
-        if not os.path.exists(p):
-            raise FileNotFoundError(p)
-        fmt = detect_excel_format(p)
-        print(f"已选择文件：{p}\n  真实格式识别为：{fmt}\n")
+st.markdown(
+    """
+- 上传 **两个文件**：订单支付报告、订单菜品报告（支持 `.xls` / `.xlsx` / “真 xls 假 xlsx”）。
+- **销售单**按 `POS销售单号` 对账；**退款单**按 `POS退款单号` 对账（只要非空就走退款逻辑）。
+- 支付表金额：`总金额`；菜品表金额：`优惠后小计价格`（同单号汇总）。
+"""
+)
 
-    # 容差：1角 = 0.10元 = 10分
-    tolerance_cents = 10
+col1, col2 = st.columns(2)
+with col1:
+    pay_file = st.file_uploader("上传【订单支付报告】", type=["xls", "xlsx"])
+with col2:
+    item_file = st.file_uploader("上传【订单菜品报告】", type=["xls", "xlsx"])
 
-    print("读取并聚合支付表…")
-    pay_sales, pay_refund = read_payment_agg(pay_path)
+tolerance_yuan = st.slider("容差（元）", min_value=0.00, max_value=1.00, value=0.10, step=0.01)
+tolerance_cents = int(round(tolerance_yuan * 100))
+preview_rows = st.number_input("差异明细预览行数", min_value=50, max_value=5000, value=500, step=50)
 
-    print("读取并聚合菜品表…")
-    item_sales, item_refund = read_items_agg(item_path)
+run_btn = st.button("开始对账", type="primary", disabled=(pay_file is None or item_file is None))
 
-    print("对账：正常订单（按 POS销售单号）…")
-    df_sale = compare_aggs(pay_sales, item_sales, kind="SALE", tolerance_cents=tolerance_cents)
+if run_btn:
+    try:
+        pay_bytes = pay_file.getvalue()
+        item_bytes = item_file.getvalue()
 
-    print("对账：退款订单（按 POS退款单号）…")
-    df_refund = compare_aggs(pay_refund, item_refund, kind="REFUND", tolerance_cents=tolerance_cents)
+        with st.spinner("读取并聚合中（大文件可能需要一会儿）…"):
+            pay_sales, pay_refund, pay_fmt = read_payment_agg(pay_bytes)
+            item_sales, item_refund, item_fmt = read_items_agg(item_bytes)
 
-    out_all = pd.concat([df_sale, df_refund], ignore_index=True)
+        st.success(f"文件识别：支付表={pay_fmt}，菜品表={item_fmt}；容差={tolerance_yuan:.2f} 元")
 
-    # 中文表头
-    out_all = out_all.rename(columns=COLUMN_CN_MAP)
+        with st.spinner("对账计算中…"):
+            df_sale = compare_aggs(pay_sales, item_sales, kind="SALE", tolerance_cents=tolerance_cents)
+            df_refund = compare_aggs(pay_refund, item_refund, kind="REFUND", tolerance_cents=tolerance_cents)
+            df_all = pd.concat([df_sale, df_refund], ignore_index=True)
 
-    # 让用户选择保存位置
-    diff_path = pick_save_path("对账差异明细.csv", "请选择【差异明细表】保存位置")
-    reason_path = pick_save_path("对账差异原因统计.csv", "请选择【差异原因统计】保存位置")
+        if df_all.empty:
+            st.info("✅ 未发现差异（在容差范围内）")
+            stat = pd.DataFrame(columns=["差异原因判断", "数量"])
+        else:
+            stat = (df_all["差异原因判断"]
+                    .value_counts()
+                    .reset_index()
+                    .rename(columns={"index": "差异原因判断", "差异原因判断": "数量"}))
 
-    out_all.to_csv(diff_path, index=False, encoding="utf-8-sig")
+        left, right = st.columns([1, 2])
 
-    # 差异原因统计
-    if out_all.empty:
-        pd.DataFrame(columns=["差异原因判断", "数量"]).to_csv(reason_path, index=False, encoding="utf-8-sig")
-        print("✅ 未发现差异（在容忍误差范围内）")
-    else:
-        stat = (out_all["差异原因判断"]
-                .value_counts()
-                .reset_index()
-                .rename(columns={"index": "差异原因判断", "差异原因判断": "数量"}))
-        stat.to_csv(reason_path, index=False, encoding="utf-8-sig")
-        print(f"✅ 发现差异条目：{len(out_all)}")
+        with left:
+            st.subheader("差异原因统计")
+            st.dataframe(stat, use_container_width=True, height=360)
+            st.download_button(
+                "下载：差异原因统计.csv",
+                data=df_to_csv_bytes(stat),
+                file_name="差异原因统计.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
 
-    print(f"✅ 已保存差异明细：{diff_path}")
-    print(f"✅ 已保存原因统计：{reason_path}")
-    print(f"容差：0.10 元（1角）")
+        with right:
+            st.subheader(f"差异明细（共 {len(df_all)} 条）")
+            st.dataframe(df_all.head(int(preview_rows)), use_container_width=True, height=520)
+            st.download_button(
+                "下载：差异明细.csv",
+                data=df_to_csv_bytes(df_all),
+                file_name="差异明细.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
 
-
-if __name__ == "__main__":
-    main()
+    except Exception as e:
+        st.error(f"运行失败：{e}")
+        st.exception(e)
